@@ -290,7 +290,7 @@ export default function Property() {
                * onBoundsChange — so panning it does not trigger a search.
                * fitToken={1} centres it on the property once.
                */}
-              <MapView pins={pins} theme={theme} fitToken={1} />
+              <MapView pins={pins} theme={theme} fitToken={1} interactive={false} />
             </div>
             <p className="muted" style={{ marginTop: 'var(--space-3)', fontSize: 'var(--text-sm)' }}>
               {listing.address.postcode} · approximate location

@@ -35,8 +35,11 @@ const DEFAULT_ZOOM = 12
  *
  * The rule that keeps this sane: one effect per concern. Creating the map,
  * swapping tiles, syncing markers and wiring drawing are four separate
- * effects with four separate dependency lists. Combining them is how you
- * end up recreating the map every time a price changes.
+ * effects with four separate dependency lists.
+ *
+ * @param interactive  true for the search page, where panning IS the
+ *                     interface. false for the small locator maps, which
+ *                     should not steal the page's scroll.
  */
 export default function MapView({
   pins = [],
@@ -49,6 +52,7 @@ export default function MapView({
   drawing = false,
   drawPoints = [],
   onDrawPoint,
+  interactive = true,
   className = '',
 }) {
   const containerRef = useRef(null)
@@ -83,9 +87,24 @@ export default function MapView({
       center: DEFAULT_CENTRE,
       zoom: DEFAULT_ZOOM,
       zoomControl: true,
-      /* Leaflet's default is a slightly rubbery scroll zoom; this is
-         calmer and matches how other map UIs behave. */
-      scrollWheelZoom: true,
+
+      /**
+       * Scroll and drag behaviour, and this is a mobile decision.
+       *
+       * On a phone, one finger dragging a full-width map pans the map
+       * instead of scrolling the page — so the reader gets stuck at the
+       * map and cannot get past it. Leaflet's own answer is to disable
+       * dragging on touch devices, which makes it show a "use two fingers
+       * to move the map" hint.
+       *
+       * The search page needs panning, so it passes interactive={true} and
+       * keeps everything. The small locator maps on the property page and
+       * in the agent's listing form pass false: no wheel zoom (which on
+       * desktop hijacks page scroll too) and no one-finger drag on touch.
+       */
+      scrollWheelZoom: interactive,
+      dragging: interactive || !L.Browser.mobile,
+
       /* Stops the user panning off into grey nothing. */
       maxBounds: L.latLngBounds([51.15, -0.7], [51.8, 0.4]),
       maxBoundsViscosity: 0.7,
@@ -98,7 +117,7 @@ export default function MapView({
     layerRef.current = L.layerGroup().addTo(map)
     drawLayerRef.current = L.layerGroup().addTo(map)
 
-        /**
+    /**
      * moveend covers panning and zooming; zoomend alone would miss drags.
      *
      * But a bounds is only meaningful if the container has actually been
@@ -146,7 +165,7 @@ export default function MapView({
       drawLayerRef.current = null
       markersRef.current.clear()
     }
-    /* Deliberately empty: the map is created once and never recreated.
+    /* Deliberately minimal: the map is created once and never recreated.
        Everything else is handled by the effects below. */
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -165,10 +184,6 @@ export default function MapView({
       /* Serves @2x tiles on retina screens, so labels aren't soft. */
       detectRetina: true,
     }).addTo(map)
-
-    /* Tiles must sit beneath markers. Leaflet puts layers in panes, and
-       the tile pane is already below the marker pane, so nothing else is
-       needed — but the order of add matters if both were in one pane. */
   }, [theme])
 
   /* ---------- 3. markers follow the pins ---------- */
@@ -188,15 +203,12 @@ export default function MapView({
        * Leaflet's default marker is a PNG referenced by a relative path
        * inside the package. Bundlers rewrite that path and the image 404s,
        * which is the classic "my markers are invisible" bug. Supplying our
-       * own HTML sidesteps it entirely — and lets the marker show a price,
-       * which is what someone scanning a property map actually wants.
+       * own HTML sidesteps it entirely — and lets the marker show a price.
        */
       const label = formatPriceShort(pin.price, pin.listingType, pin.rentPeriod)
 
       const icon = L.divIcon({
         className: '',
-        /* textContent-safe: the label comes from our own formatter, never
-           from user input, so there is nothing to escape here. */
         html: `<span class="pin" data-pin-id="${pin.id}">${label}</span>`,
         /* Sized generously and anchored at the centre-bottom so the pill
            sits above the coordinate rather than covering it. */
@@ -212,22 +224,26 @@ export default function MapView({
         title: pin.title,
       })
 
-      marker.bindPopup(
-        `<div class="map-popup">
-           <div class="map-popup-price">${label}</div>
-           <div class="map-popup-title">${escapeHtml(pin.title)}</div>
-           <a class="btn btn-primary btn-sm" href="/property/${pin.slug}">View property</a>
-         </div>`,
-        { closeButton: true, offset: [0, -14] }
-      )
+      /* The small locator maps have nothing to navigate to — they are
+         already showing that property. */
+      if (interactive) {
+        marker.bindPopup(
+          `<div class="map-popup">
+             <div class="map-popup-price">${label}</div>
+             <div class="map-popup-title">${escapeHtml(pin.title)}</div>
+             <a class="btn btn-primary btn-sm" href="/property/${pin.slug}">View property</a>
+           </div>`,
+          { closeButton: true, offset: [0, -14] }
+        )
 
-      marker.on('mouseover', () => onActiveChange?.(pin.id))
-      marker.on('mouseout', () => onActiveChange?.(null))
+        marker.on('mouseover', () => onActiveChange?.(pin.id))
+        marker.on('mouseout', () => onActiveChange?.(null))
+      }
 
       marker.addTo(layer)
       markersRef.current.set(String(pin.id), marker)
     }
-  }, [pins, onActiveChange])
+  }, [pins, onActiveChange, interactive])
 
   /* ---------- 4. highlight the active pin ---------- */
 

@@ -356,7 +356,7 @@ export default function Listings() {
               <div className="field" style={{ gridColumn: '1 / -1' }}>
                 <span className="label">Check the pin</span>
                 <div className="detail-map" style={{ height: 220 }}>
-                  <MapView pins={previewPins} theme={theme} fitToken={1} />
+                  <MapView pins={previewPins} theme={theme} fitToken={1} interactive={false} />
                 </div>
               </div>
 

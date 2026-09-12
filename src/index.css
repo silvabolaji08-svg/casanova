@@ -962,15 +962,16 @@ p {
 
 /* ---------- 12. SEARCH LAYOUT ---------- */
 
-.search-page {
+ .search-page {
   display: grid;
   grid-template-columns: minmax(420px, 44%) 1fr;
   /* Fill the viewport below the header exactly, so the two panes scroll
      independently instead of the whole page scrolling. */
   height: calc(100vh - var(--header-h));
+  
+  height: calc(100dvh - var(--header-h));
   overflow: hidden;
 }
-
 .search-panel {
   display: flex;
   flex-direction: column;
