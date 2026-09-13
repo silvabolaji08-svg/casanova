@@ -2142,3 +2142,68 @@ input[type='range'] {
     grid-template-columns: 1fr;
   }
 }
+
+/* ============================================
+   22. Search page — mobile viewport height
+   ============================================ */
+
+.search-page {
+  height: calc(100vh - var(--header-h));
+  height: calc(100dvh - var(--header-h));
+}
+
+/* ============================================
+   23. Dark mode map tiles
+   ============================================ */
+
+[data-theme='dark'] .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.9)
+    saturate(0.75);
+}
+
+/* ============================================
+   24. Stale results while refreshing
+   ============================================ */
+
+.search-results .card {
+  transition: opacity 0.25s var(--ease);
+}
+
+.search-results[data-refreshing='true'] .card {
+  opacity: 0.45;
+}
+
+.search-progress {
+  position: relative;
+  flex: 0 0 auto;
+  height: 2px;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+.search-progress::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 35%;
+  background: var(--accent);
+  animation: indeterminate 1.05s infinite ease-in-out;
+}
+
+@keyframes indeterminate {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(400%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .search-progress::after {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}

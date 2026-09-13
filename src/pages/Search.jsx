@@ -13,24 +13,9 @@ const PER_PAGE = 20
 export default function Search() {
   const { theme } = useStore()
 
-  /**
-   * The URL is the source of truth for filters.
-   *
-   * Three things fall out of that for free: the back button works, a search
-   * can be copied and shared, and a refresh doesn't lose your filters. The
-   * alternative — filters in useState — gives up all three.
-   */
   const [searchParams, setSearchParams] = useSearchParams()
   const params = useMemo(() => Object.fromEntries(searchParams), [searchParams])
 
-  /**
-   * The map viewport and the drawn shape are deliberately NOT in the URL.
-   *
-   * Panning fires constantly; writing each move to the URL would either
-   * flood the history stack or churn it. The trade-off is that a shared
-   * link carries the filters but not the exact viewport — which is the
-   * right compromise, and worth knowing you made.
-   */
   const [areaParam, setAreaParam] = useState('')
   const [useArea, setUseArea] = useState(true)
 
@@ -42,8 +27,24 @@ export default function Search() {
   const [pins, setPins] = useState([])
   const [total, setTotal] = useState(0)
   const [pages, setPages] = useState(1)
-  const [loading, setLoading] = useState(true)
-  const [mapBusy, setMapBusy] = useState(false)
+
+  /**
+   * Two loading states, not one. This is the whole fix.
+   *
+   * `hasLoaded` — have we EVER got results? False only on the very first
+   *   request, when there is genuinely nothing to show and skeletons are
+   *   the honest answer.
+   *
+   * `busy` — is a request in flight right now? True on every fetch,
+   *   including refreshes. Used to dim what's already there, not to
+   *   remove it.
+   *
+   * Collapsing these into one `loading` flag is what made the list blank
+   * out on every search: with results already on screen, throwing them
+   * away to show grey boxes is strictly worse than leaving them up.
+   */
+  const [hasLoaded, setHasLoaded] = useState(false)
+  const [busy, setBusy] = useState(true)
   const [error, setError] = useState('')
 
   const [activeId, setActiveId] = useState(null)
@@ -53,42 +54,64 @@ export default function Search() {
 
   const [term, setTerm] = useState(params.q ?? '')
 
-  const firstFitDone = useRef(false)
   const resultsRef = useRef(null)
+  const refitPendingRef = useRef(true)
 
   const page = Number(params.page) || 1
 
-  /**
-   * One string that changes exactly when the query should re-run.
-   *
-   * Using it as the dependency instead of the `params` object matters:
-   * `Object.fromEntries` produces a new object every render, so depending on
-   * it directly would refetch forever.
-   */
+  /* Filters without pagination — changing a filter should re-frame the
+     map, changing page should not. */
+  const filterKey = useMemo(() => {
+    const copy = new URLSearchParams(searchParams)
+    copy.delete('page')
+    return copy.toString()
+  }, [searchParams])
+
+  const prevFilterKey = useRef(filterKey)
+
+  /* A new search forgets the old viewport — otherwise searching Camden
+     while the map sits over Greenwich returns nothing, because the text
+     search and the stale bounds contradict each other. */
+  useEffect(() => {
+    if (prevFilterKey.current === filterKey) return
+    prevFilterKey.current = filterKey
+    setAreaParam('')
+    refitPendingRef.current = true
+  }, [filterKey])
+
   const queryKey = `${searchParams.toString()}|${useArea ? areaParam : ''}|${polygonParam}`
 
   useEffect(() => {
     const controller = new AbortController()
-    setLoading(true)
-    setMapBusy(true)
+    setBusy(true)
 
-    /* Rebuilt from searchParams inside the effect, so it always matches the
-       queryKey that triggered this run. */
     const base = Object.fromEntries(new URLSearchParams(searchParams))
     delete base.page
 
-    /* A drawn shape wins over the viewport — it is the more explicit
-       request, and the API applies the same precedence. */
     if (polygonParam) base.polygon = polygonParam
     else if (useArea && areaParam) base.bounds = areaParam
 
+    /**
+     * Both requests in one Promise.all, and every piece of state set in one
+     * .then — so the list and the map change in the same render.
+     *
+     * That is what prevents the two halves disagreeing. React batches state
+     * updates inside a single handler, so there is no moment where the map
+     * shows the new results and the list still shows the old ones.
+     *
+     * Out-of-order responses are handled by the AbortController: starting a
+     * new search aborts the previous one, so a slow earlier reply can never
+     * land after a fast later one and overwrite it.
+     */
     Promise.all([
       listingsApi.list(
-        { ...base, page: Number(new URLSearchParams(searchParams).get('page')) || 1, limit: PER_PAGE },
+        {
+          ...base,
+          page: Number(new URLSearchParams(searchParams).get('page')) || 1,
+          limit: PER_PAGE,
+        },
         { signal: controller.signal }
       ),
-      /* Pins are never paginated — hiding markers would misrepresent what
-         is for sale. This is why the endpoint returns seven fields. */
       listingsApi.pins(base, { signal: controller.signal }),
     ])
       .then(([list, pinData]) => {
@@ -97,12 +120,12 @@ export default function Search() {
         setPages(list.pages)
         setPins(pinData.items)
         setError('')
+        setHasLoaded(true)
 
-        /* Frame the results once, on the first load that returns anything.
-           Doing it on every load would yank the map away from wherever the
-           user had panned to. */
-        if (!firstFitDone.current && pinData.items.length) {
-          firstFitDone.current = true
+        /* Re-frame the map, but only on a real filter change and only when
+           there is something to frame. */
+        if (refitPendingRef.current && pinData.items.length) {
+          refitPendingRef.current = false
           setFitToken((n) => n + 1)
         }
       })
@@ -110,31 +133,19 @@ export default function Search() {
         if (err.name !== 'AbortError') setError(err.message)
       })
       .finally(() => {
-        if (!controller.signal.aborted) {
-          setLoading(false)
-          setMapBusy(false)
-        }
+        if (!controller.signal.aborted) setBusy(false)
       })
 
     return () => controller.abort()
-    /* queryKey encodes every input; the others are read fresh inside. */
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queryKey])
 
-  /* Keep the search box in step when the URL changes from elsewhere — a
-     footer link, the back button. */
   useEffect(() => {
     setTerm(params.q ?? '')
   }, [params.q])
 
   /* ---------- handlers ---------- */
 
-  /**
-   * Merge a partial change into the URL.
-   *
-   * An empty value deletes the parameter rather than setting it blank, which
-   * keeps the URL readable and matches what the API treats as "no filter".
-   */
   const patch = useCallback(
     (changes) => {
       const next = new URLSearchParams(searchParams)
@@ -142,8 +153,6 @@ export default function Search() {
         if (value === '' || value === null || value === undefined) next.delete(key)
         else next.set(key, String(value))
       }
-      /* Any filter change invalidates the current page number — you should
-         land on page 1 of the new results, not page 4 of nothing. */
       next.delete('page')
       setSearchParams(next, { replace: true })
     },
@@ -159,7 +168,10 @@ export default function Search() {
 
   const submitTerm = (e) => {
     e.preventDefault()
+    setPolygonParam('')
+    setDrawPoints([])
     patch({ q: term.trim() })
+    setView('list')
   }
 
   const goToPage = (n) => {
@@ -170,7 +182,6 @@ export default function Search() {
     resultsRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
-  /* MapView debounces before calling this, so it fires once per gesture. */
   const handleBounds = useCallback((bounds) => {
     setAreaParam(boundsToParam(bounds))
   }, [])
@@ -198,13 +209,18 @@ export default function Search() {
     setView('map')
   }
 
-  /* ---------- render ---------- */
-
   const areaLabel = polygonParam
     ? 'Inside your shape'
     : useArea && areaParam
       ? 'In the map area'
-      : 'Everywhere'
+      : params.q
+        ? `matching “${params.q}”`
+        : 'across London'
+
+  /* Skeletons only when there is genuinely nothing to show. */
+  const showSkeletons = !hasLoaded
+  /* Dim what's there while fetching a replacement. */
+  const refreshing = busy && hasLoaded
 
   return (
     <div className="search-page" data-view={view}>
@@ -238,15 +254,26 @@ export default function Search() {
           </button>
         </form>
 
-        <div ref={resultsRef} className="search-results">
+        {/* A 2px bar rather than a layout change — nothing moves. */}
+        {busy && <div className="search-progress" aria-hidden="true" />}
+
+        <div
+          ref={resultsRef}
+          className="search-results"
+          data-refreshing={refreshing ? 'true' : 'false'}
+          /* Tells a screen reader the region is being updated, so it can
+             wait rather than announcing half-changed content. */
+          aria-busy={busy}
+        >
           <div className="search-count">
             <span>
-              {loading ? (
+              {showSkeletons ? (
                 'Searching…'
               ) : (
                 <>
                   <strong style={{ color: 'var(--text)' }}>{total}</strong>{' '}
-                  {total === 1 ? 'home' : 'homes'} · {areaLabel}
+                  {total === 1 ? 'home' : 'homes'} {areaLabel}
+                  {refreshing && <span className="muted"> · updating</span>}
                 </>
               )}
             </span>
@@ -265,10 +292,14 @@ export default function Search() {
             </div>
           )}
 
-          {loading ? (
+          {showSkeletons ? (
             <>
               {[0, 1, 2, 3].map((i) => (
-                <div key={i} className="skeleton" style={{ height: 120, borderRadius: 'var(--radius)' }} />
+                <div
+                  key={i}
+                  className="skeleton"
+                  style={{ height: 120, borderRadius: 'var(--radius)' }}
+                />
               ))}
             </>
           ) : items.length === 0 ? (
@@ -278,7 +309,7 @@ export default function Search() {
               <p>
                 {polygonParam || (useArea && areaParam)
                   ? 'Try zooming out, clearing the drawn area, or relaxing a filter.'
-                  : 'Try relaxing a filter or widening the price range.'}
+                  : 'Try a different area, or relax a filter.'}
               </p>
               <button className="btn btn-secondary btn-sm" onClick={reset}>
                 Clear everything
@@ -297,12 +328,15 @@ export default function Search() {
             ))
           )}
 
-          {pages > 1 && !loading && (
-            <div className="row" style={{ justifyContent: 'center', paddingTop: 'var(--space-4)' }}>
+          {pages > 1 && !showSkeletons && (
+            <div
+              className="row"
+              style={{ justifyContent: 'center', paddingTop: 'var(--space-4)' }}
+            >
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={() => goToPage(page - 1)}
-                disabled={page <= 1}
+                disabled={page <= 1 || busy}
               >
                 <Icon name="chevronLeft" size={14} />
                 Previous
@@ -313,7 +347,7 @@ export default function Search() {
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={() => goToPage(page + 1)}
-                disabled={page >= pages}
+                disabled={page >= pages || busy}
               >
                 Next
                 <Icon name="chevronRight" size={14} />
@@ -337,7 +371,13 @@ export default function Search() {
           onDrawPoint={handleDrawPoint}
         />
 
-        {mapBusy && <div className="map-loading">Updating…</div>}
+        {/* Only on the first load. After that the 2px bar in the panel is
+            enough — a badge appearing over the map on every pan is noise. */}
+        {busy && !hasLoaded && (
+          <div className="map-loading" role="status">
+            Finding properties…
+          </div>
+        )}
 
         <div className="map-tools">
           {!drawing && !polygonParam && (
