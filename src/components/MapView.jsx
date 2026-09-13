@@ -1,11 +1,11 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import L from 'leaflet'
 
 import { formatPriceShort } from '../lib/format.js'
 import { useDebouncedCallback } from '../hooks/useDebounce.js'
 
-/* TEMPORARY. Set to false once this is solved. */
-const DEBUG_MAP = true
+/* Flip to true when the map misbehaves. */
+const DEBUG_MAP = false
 
 /**
  * OpenStreetMap's own tile server. Genuinely free, no key, no account.
@@ -30,13 +30,19 @@ const DEFAULT_ZOOM = 12
 /**
  * How much the viewport must actually change before it counts as a new
  * search area, as a fraction of the viewport's own size.
- *
- * 1% of the visible span is a movement nobody can see. Anything smaller
- * than this is the map settling — a resize, a nudge back inside
- * maxBounds, an animation landing a pixel off — and re-running the search
- * for it is pure waste at best and an infinite loop at worst.
  */
 const BOUNDS_TOLERANCE = 0.01
+
+/**
+ * Smallest container we will do geometry on, in pixels.
+ *
+ * A hidden element measures 0×0. Leaflet's fitBounds divides by the
+ * container size to work out a zoom level, so a zero-size map produces
+ * Infinity, then a NaN centre, then a thrown error that takes the whole
+ * React tree down with it. Everything that reads the map's geometry
+ * checks this first.
+ */
+const MIN_USABLE_PX = 2
 
 /**
  * Spreads markers that sit on top of each other.
@@ -79,13 +85,17 @@ function reducedMotion() {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
+/* A coordinate we can safely hand to Leaflet. */
+function usablePin(pin) {
+  return Number.isFinite(pin?.lat) && Number.isFinite(pin?.lng)
+}
+
 /**
  * Has the view moved enough to be worth a new search?
  *
  * Compared against the size of the viewport rather than a fixed number of
  * degrees, because a movement that is trivial at city zoom is enormous at
- * street zoom. A tolerance in degrees would be wrong at one end or the
- * other; a tolerance in percent is right at both.
+ * street zoom.
  */
 function movedEnough(previous, next) {
   if (!previous) return true
@@ -153,10 +163,83 @@ export default function MapView({
   /* The last viewport we actually told the page about. */
   const lastEmittedRef = useRef(null)
 
+  /* A fit that was asked for while the map was hidden, still owed. */
+  const pendingFitRef = useRef(false)
+
+  /**
+   * The current pins, readable from callbacks that must not re-subscribe.
+   *
+   * The fit runs from two places — the effect, and the resize handler
+   * registered once at mount — and both need today's pins. A ref gives
+   * them that without making either depend on the pins array, which would
+   * mean tearing down and re-registering on every search.
+   */
+  const pinsRef = useRef(pins)
+  useEffect(() => {
+    pinsRef.current = pins
+  }, [pins])
+
   /* Debounced so a drag produces one request, not forty. */
   const emitBounds = useDebouncedCallback((bounds) => {
     onBoundsChange?.(bounds)
   }, 400)
+
+  /**
+   * Frame the current pins. Returns false if it couldn't.
+   *
+   * "Couldn't" almost always means the map is hidden — the mobile layout
+   * swaps the map out for the list with display:none, and a hidden element
+   * measures 0×0. Asking Leaflet to fit a bounding box into zero pixels
+   * throws, and an uncaught throw during a React update blanks the entire
+   * page. Refusing and reporting back is the whole fix.
+   */
+  const fitToPins = useCallback(() => {
+    const map = mapRef.current
+    if (!map) return false
+
+    const size = map.getSize()
+    if (size.x < MIN_USABLE_PX || size.y < MIN_USABLE_PX) return false
+
+    const usable = pinsRef.current.filter(usablePin)
+    if (!usable.length) return false
+
+    const bounds = L.latLngBounds(usable.map((p) => [p.lat, p.lng]))
+    if (!bounds.isValid()) return false
+
+    if (DEBUG_MAP) console.log('[map] FIT', bounds.toBBoxString())
+
+    /* Flag BEFORE moving, so the moveend this causes is recognised as ours
+       and does not kick off a bounds-filtered refetch. */
+    programmaticRef.current = true
+
+    /**
+     * A safety net for the flag.
+     *
+     * If the map is already exactly where the fit wants it, Leaflet moves
+     * nothing and fires no moveend — so the flag would stay raised and
+     * silently swallow the user's next real pan. Clearing it after the
+     * animation's own lifetime means a missing moveend costs nothing.
+     */
+    clearTimeout(programmaticTimerRef.current)
+    programmaticTimerRef.current = setTimeout(() => {
+      programmaticRef.current = false
+    }, 1200)
+
+    const options = {
+      padding: [56, 56],
+      /* Don't zoom past street level even for a single result — one pin
+         filling the screen loses all context. */
+      maxZoom: 15,
+    }
+
+    if (reducedMotion()) {
+      map.fitBounds(bounds, { ...options, animate: false })
+    } else {
+      map.flyToBounds(bounds, { ...options, duration: 0.8 })
+    }
+
+    return true
+  }, [])
 
   /* ---------- 1. create the map, once ---------- */
 
@@ -208,15 +291,9 @@ export default function MapView({
         return
       }
 
-      /**
-       * A bounds is only meaningful once the container has been measured.
-       * A hidden map (display:none, which the mobile toggle uses) reports
-       * 0×0, and getBounds() then collapses to a single point. MongoDB
-       * rejects the resulting polygon: "Loop must have at least 3 different
-       * vertices".
-       */
+      /* Same zero-size trap as the fit, on the reading side. */
       const size = map.getSize()
-      if (size.x < 2 || size.y < 2) return
+      if (size.x < MIN_USABLE_PX || size.y < MIN_USABLE_PX) return
 
       const bounds = map.getBounds()
       const sw = bounds.getSouthWest()
@@ -225,14 +302,10 @@ export default function MapView({
       if (sw.lng === ne.lng || sw.lat === ne.lat) return
 
       /**
-       * The real brake.
-       *
        * invalidateSize(), a nudge back inside maxBounds, an animation
-       * landing a fraction off — all of these fire moveend without the
-       * user having done anything. Reporting them starts a search, which
-       * re-renders the page, which can resize the map, which fires
-       * moveend. Comparing against the last viewport we reported breaks
-       * that circuit no matter which of them caused it.
+       * landing a fraction off — all fire moveend without the user having
+       * done anything. Comparing against the last viewport we reported
+       * breaks the refetch loop no matter which of them caused it.
        */
       if (!movedEnough(lastEmittedRef.current, bounds)) {
         if (DEBUG_MAP) console.log('[map] moveend — too small, ignored')
@@ -251,8 +324,14 @@ export default function MapView({
      * wrong size and renders tiles into a strip.
      */
     const ro = new ResizeObserver(() => {
-      if (DEBUG_MAP) console.log('[map] resize', map.getSize().x, map.getSize().y)
       map.invalidateSize({ pan: false })
+
+      /* The map has just become visible and we owe it a fit. This is how
+         switching to Map view on a phone lands on the right area rather
+         than on the default view of central London. */
+      if (pendingFitRef.current && fitToPins()) {
+        pendingFitRef.current = false
+      }
     })
     ro.observe(el)
 
@@ -296,12 +375,10 @@ export default function MapView({
     const layer = layerRef.current
     if (!map || !layer) return
 
-    if (DEBUG_MAP) console.log('[map] rebuilding', pins.length, 'markers')
-
     layer.clearLayers()
     markersRef.current.clear()
 
-    for (const pin of spreadOverlapping(pins)) {
+    for (const pin of spreadOverlapping(pins.filter(usablePin))) {
       /**
        * A divIcon, not Leaflet's default marker.
        *
@@ -370,48 +447,15 @@ export default function MapView({
   /* ---------- 5. re-frame the view when asked ---------- */
 
   useEffect(() => {
-    const map = mapRef.current
-    if (!map || !fitToken) return
+    if (!fitToken) return
 
-    /* Nothing to frame — leave the map where it is. A search with no
-       results should not jump the view somewhere arbitrary. */
-    if (!pins.length) return
-
-    const bounds = L.latLngBounds(pins.map((p) => [p.lat, p.lng]))
-
-    if (DEBUG_MAP) console.log('[map] FIT', fitToken, bounds.toBBoxString())
-
-    /* Flag BEFORE moving, so the moveend this causes is recognised as ours
-       and does not kick off a bounds-filtered refetch. */
-    programmaticRef.current = true
-
-    /**
-     * A safety net for the flag.
-     *
-     * If the map is already exactly where the fit wants it, Leaflet moves
-     * nothing and fires no moveend — so the flag would stay raised and
-     * silently swallow the user's next real pan. Clearing it after the
-     * animation's own lifetime means a missing moveend costs nothing.
-     */
-    clearTimeout(programmaticTimerRef.current)
-    programmaticTimerRef.current = setTimeout(() => {
-      programmaticRef.current = false
-    }, 1200)
-
-    const options = {
-      padding: [56, 56],
-      /* Don't zoom past street level even for a single result — one pin
-         filling the screen loses all context. */
-      maxZoom: 15,
+    /* If the map is hidden right now, remember that we owe it a fit and
+       let the resize handler do it the moment it appears. */
+    if (!fitToPins()) {
+      pendingFitRef.current = true
+      if (DEBUG_MAP) console.log('[map] fit deferred — map not visible')
     }
-
-    if (reducedMotion()) {
-      map.fitBounds(bounds, { ...options, animate: false })
-    } else {
-      map.flyToBounds(bounds, { ...options, duration: 0.8 })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fitToken])
+  }, [fitToken, fitToPins])
 
   /* ---------- 6. drawing a search area ---------- */
 
@@ -478,6 +522,8 @@ function escapeHtml(text) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
 }
