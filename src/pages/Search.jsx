@@ -10,6 +10,21 @@ import { useStore } from '../context/StoreContext.jsx'
 
 const PER_PAGE = 20
 
+/* How long after we move the map ourselves we refuse to treat a viewport
+   report as a user action. The fly-to animation runs for 0.8s; this gives
+   it room to finish and settle. */
+const FIT_QUIET_MS = 1200
+
+/* Same listings in the same order? Then it is the same set, whatever the
+   server sent us as a fresh array. */
+function samePins(a, b) {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i].id !== b[i].id) return false
+  }
+  return true
+}
+
 export default function Search() {
   const { theme } = useStore()
 
@@ -29,7 +44,7 @@ export default function Search() {
   const [pages, setPages] = useState(1)
 
   /**
-   * Two loading states, not one. This is the whole fix.
+   * Two loading states, not one.
    *
    * `hasLoaded` — have we EVER got results? False only on the very first
    *   request, when there is genuinely nothing to show and skeletons are
@@ -38,10 +53,6 @@ export default function Search() {
    * `busy` — is a request in flight right now? True on every fetch,
    *   including refreshes. Used to dim what's already there, not to
    *   remove it.
-   *
-   * Collapsing these into one `loading` flag is what made the list blank
-   * out on every search: with results already on screen, throwing them
-   * away to show grey boxes is strictly worse than leaving them up.
    */
   const [hasLoaded, setHasLoaded] = useState(false)
   const [busy, setBusy] = useState(true)
@@ -56,6 +67,9 @@ export default function Search() {
 
   const resultsRef = useRef(null)
   const refitPendingRef = useRef(true)
+
+  /* When we last moved the map ourselves. See handleBounds. */
+  const fitAtRef = useRef(0)
 
   const page = Number(params.page) || 1
 
@@ -79,9 +93,21 @@ export default function Search() {
     refitPendingRef.current = true
   }, [filterKey])
 
+  /**
+   * Ask the map to re-frame itself, and remember when we did.
+   *
+   * Every fit must go through here. The timestamp is what lets
+   * handleBounds tell our own movement apart from the user's.
+   */
+  const requestFit = useCallback(() => {
+    fitAtRef.current = Date.now()
+    setFitToken((n) => n + 1)
+  }, [])
+
   const queryKey = `${searchParams.toString()}|${useArea ? areaParam : ''}|${polygonParam}`
 
-  useEffect(() => {
+    useEffect(() => {
+    console.log('[search] fetch', queryKey)
     const controller = new AbortController()
     setBusy(true)
 
@@ -94,14 +120,6 @@ export default function Search() {
     /**
      * Both requests in one Promise.all, and every piece of state set in one
      * .then — so the list and the map change in the same render.
-     *
-     * That is what prevents the two halves disagreeing. React batches state
-     * updates inside a single handler, so there is no moment where the map
-     * shows the new results and the list still shows the old ones.
-     *
-     * Out-of-order responses are handled by the AbortController: starting a
-     * new search aborts the previous one, so a slow earlier reply can never
-     * land after a fast later one and overwrite it.
      */
     Promise.all([
       listingsApi.list(
@@ -118,7 +136,18 @@ export default function Search() {
         setItems(list.items)
         setTotal(list.total)
         setPages(list.pages)
-        setPins(pinData.items)
+
+        /**
+         * Keep the OLD array when the pins are unchanged.
+         *
+         * The server hands us a brand-new array on every reply, even when
+         * it contains exactly the same properties. React compares props by
+         * identity, so a new array — however identical its contents — looks
+         * to the map like new data and re-runs its effects. Returning `prev`
+         * keeps the identity stable and the map stays still.
+         */
+        setPins((prev) => (samePins(prev, pinData.items) ? prev : pinData.items))
+
         setError('')
         setHasLoaded(true)
 
@@ -126,7 +155,7 @@ export default function Search() {
            there is something to frame. */
         if (refitPendingRef.current && pinData.items.length) {
           refitPendingRef.current = false
-          setFitToken((n) => n + 1)
+          requestFit()
         }
       })
       .catch((err) => {
@@ -182,7 +211,16 @@ export default function Search() {
     resultsRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
+  /**
+   * The map reports its viewport on every move — including the moves we
+   * asked for. Acting on our own fit is what created the runaway: fit,
+   * report, refetch, fit again, each pass drifting further out of London.
+   *
+   * A viewport report inside the quiet window after a fit is ours, so it
+   * is dropped. Anything later is the user, and starts a real search.
+   */
   const handleBounds = useCallback((bounds) => {
+    if (Date.now() - fitAtRef.current < FIT_QUIET_MS) return
     setAreaParam(boundsToParam(bounds))
   }, [])
 
@@ -210,9 +248,9 @@ export default function Search() {
   }
 
   const areaLabel = polygonParam
-    ? 'Inside your shape'
+    ? 'inside your shape'
     : useArea && areaParam
-      ? 'In the map area'
+      ? 'in the map area'
       : params.q
         ? `matching “${params.q}”`
         : 'across London'
@@ -431,7 +469,7 @@ export default function Search() {
           <button
             type="button"
             className="map-tool"
-            onClick={() => setFitToken((n) => n + 1)}
+            onClick={requestFit}
             disabled={!pins.length}
           >
             <Icon name="target" size={14} />

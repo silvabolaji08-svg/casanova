@@ -4,17 +4,16 @@ import L from 'leaflet'
 import { formatPriceShort } from '../lib/format.js'
 import { useDebouncedCallback } from '../hooks/useDebounce.js'
 
+/* TEMPORARY. Set to false once this is solved. */
+const DEBUG_MAP = true
+
 /**
  * OpenStreetMap's own tile server. Genuinely free, no key, no account.
  *
  * CARTO's basemaps now require an API key and watermark their tiles
  * without one, which is why this changed. There is no dark OSM tileset,
  * so dark mode inverts these with a CSS filter on the tile pane — see
- * section 22 of index.css.
- *
- * OSM's tile policy is fine with a portfolio project's traffic. A real
- * site with real users would move to a paid provider (CARTO, Mapbox,
- * Stadia, MapTiler) — all of which need a key, which is the trade.
+ * section 23 of index.css.
  */
 const TILES = {
   light: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
@@ -29,6 +28,17 @@ const DEFAULT_CENTRE = [51.5074, -0.1278]
 const DEFAULT_ZOOM = 12
 
 /**
+ * How much the viewport must actually change before it counts as a new
+ * search area, as a fraction of the viewport's own size.
+ *
+ * 1% of the visible span is a movement nobody can see. Anything smaller
+ * than this is the map settling — a resize, a nudge back inside
+ * maxBounds, an animation landing a pixel off — and re-running the search
+ * for it is pure waste at best and an infinite loop at worst.
+ */
+const BOUNDS_TOLERANCE = 0.01
+
+/**
  * Spreads markers that sit on top of each other.
  *
  * Two flats in the same building have coordinates within a few metres, so
@@ -36,9 +46,6 @@ const DEFAULT_ZOOM = 12
  * invisible. This nudges each duplicate outward along a golden-angle
  * spiral — the same arrangement as seeds in a sunflower head, which packs
  * points evenly without them lining up in spokes.
- *
- * Grouping is on four decimal places, roughly 11 metres. Anything further
- * apart separates on its own once you zoom in.
  */
 function spreadOverlapping(pins) {
   const seen = new Map()
@@ -73,16 +80,36 @@ function reducedMotion() {
 }
 
 /**
+ * Has the view moved enough to be worth a new search?
+ *
+ * Compared against the size of the viewport rather than a fixed number of
+ * degrees, because a movement that is trivial at city zoom is enormous at
+ * street zoom. A tolerance in degrees would be wrong at one end or the
+ * other; a tolerance in percent is right at both.
+ */
+function movedEnough(previous, next) {
+  if (!previous) return true
+
+  const latSpan = Math.abs(next.getNorth() - next.getSouth())
+  const lngSpan = Math.abs(next.getEast() - next.getWest())
+  const latTol = latSpan * BOUNDS_TOLERANCE
+  const lngTol = lngSpan * BOUNDS_TOLERANCE
+
+  return (
+    Math.abs(previous.getNorth() - next.getNorth()) > latTol ||
+    Math.abs(previous.getSouth() - next.getSouth()) > latTol ||
+    Math.abs(previous.getEast() - next.getEast()) > lngTol ||
+    Math.abs(previous.getWest() - next.getWest()) > lngTol
+  )
+}
+
+/**
  * Leaflet, driven directly.
  *
  * React and Leaflet want opposite things: React describes what the DOM
  * should look like, Leaflet owns a piece of DOM and mutates it. So the
  * container div is the only thing React renders, and every change after
  * that is an imperative call inside an effect.
- *
- * The rule that keeps this sane: one effect per concern, each with its own
- * dependency list. Merge them and changing the theme would tear down and
- * rebuild the whole map, losing the user's pan position.
  *
  * @param interactive  true for the search page, where panning IS the
  *                     interface. false for the small locator maps, which
@@ -121,6 +148,10 @@ export default function MapView({
    * not.
    */
   const programmaticRef = useRef(false)
+  const programmaticTimerRef = useRef(null)
+
+  /* The last viewport we actually told the page about. */
+  const lastEmittedRef = useRef(null)
 
   /* Debounced so a drag produces one request, not forty. */
   const emitBounds = useDebouncedCallback((bounds) => {
@@ -151,13 +182,7 @@ export default function MapView({
        *
        * On a phone, one finger dragging a full-width map pans the map
        * instead of scrolling the page — so the reader gets stuck at the
-       * map and cannot get past it. Leaflet's answer is to disable
-       * dragging on touch devices, which makes it show a "use two fingers
-       * to move the map" hint.
-       *
-       * The search page needs panning and passes interactive={true}. The
-       * small locator maps pass false: no wheel zoom (which on desktop
-       * hijacks page scroll too) and no one-finger drag on touch.
+       * map and cannot get past it.
        */
       scrollWheelZoom: interactive,
       dragging: interactive || !L.Browser.mobile,
@@ -178,6 +203,8 @@ export default function MapView({
       /* Our own fit — consume the flag and report nothing. */
       if (programmaticRef.current) {
         programmaticRef.current = false
+        clearTimeout(programmaticTimerRef.current)
+        if (DEBUG_MAP) console.log('[map] moveend — ours, ignored')
         return
       }
 
@@ -197,6 +224,23 @@ export default function MapView({
       /* A rectangle needs width AND height. */
       if (sw.lng === ne.lng || sw.lat === ne.lat) return
 
+      /**
+       * The real brake.
+       *
+       * invalidateSize(), a nudge back inside maxBounds, an animation
+       * landing a fraction off — all of these fire moveend without the
+       * user having done anything. Reporting them starts a search, which
+       * re-renders the page, which can resize the map, which fires
+       * moveend. Comparing against the last viewport we reported breaks
+       * that circuit no matter which of them caused it.
+       */
+      if (!movedEnough(lastEmittedRef.current, bounds)) {
+        if (DEBUG_MAP) console.log('[map] moveend — too small, ignored')
+        return
+      }
+
+      lastEmittedRef.current = bounds
+      if (DEBUG_MAP) console.log('[map] moveend — EMIT', bounds.toBBoxString())
       emitBounds(bounds)
     })
 
@@ -206,14 +250,18 @@ export default function MapView({
      * list/map toggle, and with flex layouts generally — it computes the
      * wrong size and renders tiles into a strip.
      */
-    const ro = new ResizeObserver(() => map.invalidateSize())
+    const ro = new ResizeObserver(() => {
+      if (DEBUG_MAP) console.log('[map] resize', map.getSize().x, map.getSize().y)
+      map.invalidateSize({ pan: false })
+    })
     ro.observe(el)
 
     /* One more nudge after the first paint, for the initial layout. */
-    const raf = requestAnimationFrame(() => map.invalidateSize())
+    const raf = requestAnimationFrame(() => map.invalidateSize({ pan: false }))
 
     return () => {
       cancelAnimationFrame(raf)
+      clearTimeout(programmaticTimerRef.current)
       ro.disconnect()
       map.remove()
       mapRef.current = null
@@ -248,6 +296,8 @@ export default function MapView({
     const layer = layerRef.current
     if (!map || !layer) return
 
+    if (DEBUG_MAP) console.log('[map] rebuilding', pins.length, 'markers')
+
     layer.clearLayers()
     markersRef.current.clear()
 
@@ -259,10 +309,6 @@ export default function MapView({
        * package, which bundlers rewrite and break — the classic "invisible
        * markers" bug. Our own HTML avoids it entirely, and shows the price,
        * which is what someone scanning a property map actually wants.
-       *
-       * Leaflet already stacks markers by latitude, so a southern pin draws
-       * in front of a northern one; hovering raises the active pin above
-       * everything via z-index in the CSS.
        */
       const label = formatPriceShort(pin.price, pin.listingType, pin.rentPeriod)
 
@@ -333,9 +379,24 @@ export default function MapView({
 
     const bounds = L.latLngBounds(pins.map((p) => [p.lat, p.lng]))
 
+    if (DEBUG_MAP) console.log('[map] FIT', fitToken, bounds.toBBoxString())
+
     /* Flag BEFORE moving, so the moveend this causes is recognised as ours
        and does not kick off a bounds-filtered refetch. */
     programmaticRef.current = true
+
+    /**
+     * A safety net for the flag.
+     *
+     * If the map is already exactly where the fit wants it, Leaflet moves
+     * nothing and fires no moveend — so the flag would stay raised and
+     * silently swallow the user's next real pan. Clearing it after the
+     * animation's own lifetime means a missing moveend costs nothing.
+     */
+    clearTimeout(programmaticTimerRef.current)
+    programmaticTimerRef.current = setTimeout(() => {
+      programmaticRef.current = false
+    }, 1200)
 
     const options = {
       padding: [56, 56],
@@ -347,9 +408,6 @@ export default function MapView({
     if (reducedMotion()) {
       map.fitBounds(bounds, { ...options, animate: false })
     } else {
-      /* flyToBounds fires moveend exactly once, when it lands — so the
-         guard above is consumed at the right moment. A plain animated
-         fitBounds fires it repeatedly and would not be safe here. */
       map.flyToBounds(bounds, { ...options, duration: 0.8 })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
